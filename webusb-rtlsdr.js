@@ -533,6 +533,11 @@ class WebUSBSpectrumAnalyzer {
     this.running = false;
     this.onSpectrum = null;  // callback(data)
 
+    // Decode support — when enabled, reads larger IQ chunks and forwards raw IQ
+    this.decodeEnabled = false;
+    this.decodeSamples = 32768;  // 13.6ms at 2.4 MSPS (vs 0.4ms for FFT-only)
+    this.onRawIQ = null;         // callback(Float32Array of interleaved IQ)
+
     // Averaging
     this.avgBuffer = null;
     this.avgAlpha = 0.3;
@@ -598,10 +603,27 @@ class WebUSBSpectrumAnalyzer {
     while (this.running) {
       const t0 = performance.now();
       try {
-        const iq = await this.sdr.readSamples(this.fftSize);
-        const result = this._processFFT(iq);
-        if (this.onSpectrum) {
-          this.onSpectrum(result);
+        if (this.decodeEnabled && this.onRawIQ) {
+          // Larger read for both FFT and decode
+          const numSamples = Math.max(this.fftSize, this.decodeSamples);
+          const iq = await this.sdr.readSamples(numSamples);
+
+          // FFT uses first fftSize samples (zero-copy subarray)
+          const fftIQ = iq.subarray(0, this.fftSize * 2);
+          const result = this._processFFT(fftIQ);
+          if (this.onSpectrum) {
+            this.onSpectrum(result);
+          }
+
+          // Forward full IQ buffer to decode pipeline
+          this.onRawIQ(iq);
+        } else {
+          // Standard FFT-only read
+          const iq = await this.sdr.readSamples(this.fftSize);
+          const result = this._processFFT(iq);
+          if (this.onSpectrum) {
+            this.onSpectrum(result);
+          }
         }
       } catch (e) {
         console.error('[WebUSB Analyzer] Read error:', e);
