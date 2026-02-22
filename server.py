@@ -18,6 +18,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
+from scipy.signal.windows import blackmanharris
 
 try:
     from rtlsdr import RtlSdr
@@ -74,7 +75,7 @@ class SpectrumAnalyzer:
         self.peak_hold = None
 
         # Window function (pre-computed)
-        self.window = np.blackmanharris(self.fft_size)
+        self.window = blackmanharris(self.fft_size)
 
     # ----- device control -----
 
@@ -110,11 +111,11 @@ class SpectrumAnalyzer:
         self.sample_rate = rate
         if self.sdr:
             self.sdr.sample_rate = rate
-        self.window = np.blackmanharris(self.fft_size)
+        self.window = blackmanharris(self.fft_size)
 
     def set_fft_size(self, size):
         self.fft_size = size
-        self.window = np.blackmanharris(self.fft_size)
+        self.window = blackmanharris(self.fft_size)
         self.avg_buffer = None
         self.peak_hold = None
 
