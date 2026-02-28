@@ -2,276 +2,76 @@
 """
 UHF RFID Spectrum Analyzer — RTL-SDR Backend
 
-Streams FFT data over WebSocket to the browser-based UI.
-Designed for monitoring UHF RFID bands (860–960 MHz).
+Streams FFT spectrum + decoded RFID commands over WebSocket.
+Handles device discovery, selection, and both real (PIE decode from IQ)
+and simulated (mock Gen2 sequences) operating modes.
 """
 
 import argparse
 import asyncio
 import json
 import logging
-import os
-import struct
+import random
 import threading
-import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
-import numpy as np
-from scipy.signal.windows import blackmanharris
-
-try:
-    from rtlsdr import RtlSdr
-    HAS_RTLSDR = True
-except ImportError:
-    HAS_RTLSDR = False
-
 import websockets
+
+from rfid_decoder import (
+    RFID_BANDS,
+    DEFAULT_CENTER_FREQ,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_GAIN,
+    DEFAULT_FFT_SIZE,
+    PIEDecoder,
+    MockRFIDDecoder,
+    SpectrumAnalyzer,
+    SimulatedAnalyzer,
+    enumerate_devices,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("rfid-spectrum")
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults (server-specific)
 # ---------------------------------------------------------------------------
-DEFAULT_CENTER_FREQ = 915e6      # 915 MHz — US UHF RFID center
-DEFAULT_SAMPLE_RATE = 2.4e6      # 2.4 MSPS
-DEFAULT_GAIN = 40                # dB
-DEFAULT_FFT_SIZE = 1024
 DEFAULT_WS_PORT = 8765
 DEFAULT_HTTP_PORT = 8080
 
-# UHF RFID regional band definitions (MHz)
-RFID_BANDS = {
-    "FCC (US)":       {"start": 902.0, "end": 928.0, "channels": 50, "power": "1W ERP"},
-    "ETSI (EU)":      {"start": 865.6, "end": 867.6, "channels": 4,  "power": "2W ERP"},
-    "China":          {"start": 920.0, "end": 925.0, "channels": 16, "power": "2W ERP"},
-    "Japan":          {"start": 916.8, "end": 920.4, "channels": 9,  "power": "250mW"},
-    "Korea":          {"start": 917.0, "end": 923.5, "channels": 13, "power": "200mW"},
-    "Brazil":         {"start": 902.0, "end": 907.5, "channels": 11, "power": "4W EIRP"},
-    "Australia":      {"start": 920.0, "end": 926.0, "channels": 12, "power": "1W EIRP"},
-}
 
-
-class SpectrumAnalyzer:
-    """Wraps the RTL-SDR device and produces FFT magnitude arrays."""
-
-    def __init__(self, center_freq=DEFAULT_CENTER_FREQ,
-                 sample_rate=DEFAULT_SAMPLE_RATE,
-                 gain=DEFAULT_GAIN,
-                 fft_size=DEFAULT_FFT_SIZE,
-                 device_index=0):
-        self.center_freq = center_freq
-        self.sample_rate = sample_rate
-        self.gain = gain
-        self.fft_size = fft_size
-        self.device_index = device_index
-        self.sdr = None
-        self.running = False
-
-        # Averaging / peak-hold state
-        self.avg_buffer = None
-        self.avg_alpha = 0.3          # EMA smoothing factor
-        self.peak_hold = None
-
-        # Window function (pre-computed)
-        self.window = blackmanharris(self.fft_size)
-
-    # ----- device control -----
-
-    def open(self):
-        if not HAS_RTLSDR:
-            raise RuntimeError("pyrtlsdr is not installed")
-        self.sdr = RtlSdr(self.device_index)
-        self.sdr.center_freq = self.center_freq
-        self.sdr.sample_rate = self.sample_rate
-        self.sdr.gain = self.gain
-        self.running = True
-        log.info("RTL-SDR opened  fc=%.3f MHz  fs=%.3f MHz  gain=%s dB",
-                 self.center_freq / 1e6, self.sample_rate / 1e6, self.gain)
-
-    def close(self):
-        self.running = False
-        if self.sdr is not None:
-            self.sdr.close()
-            self.sdr = None
-            log.info("RTL-SDR closed")
-
-    def set_center_freq(self, freq):
-        self.center_freq = freq
-        if self.sdr:
-            self.sdr.center_freq = freq
-
-    def set_gain(self, gain):
-        self.gain = gain
-        if self.sdr:
-            self.sdr.gain = gain
-
-    def set_sample_rate(self, rate):
-        self.sample_rate = rate
-        if self.sdr:
-            self.sdr.sample_rate = rate
-        self.window = blackmanharris(self.fft_size)
-
-    def set_fft_size(self, size):
-        self.fft_size = size
-        self.window = blackmanharris(self.fft_size)
-        self.avg_buffer = None
-        self.peak_hold = None
-
-    # ----- DSP -----
-
-    def read_spectrum(self):
-        """Read samples from the SDR and return (freqs_mhz, magnitudes_db)."""
-        if self.sdr is None:
-            raise RuntimeError("SDR not open")
-
-        samples = self.sdr.read_samples(self.fft_size)
-        return self._compute_fft(samples)
-
-    def _compute_fft(self, samples):
-        """Compute power spectral density from IQ samples."""
-        n = self.fft_size
-        iq = np.array(samples[:n])
-
-        # Apply window
-        windowed = iq * self.window
-
-        # FFT → shift DC to center
-        spectrum = np.fft.fftshift(np.fft.fft(windowed, n))
-
-        # Power in dB (avoid log10(0))
-        magnitude = np.abs(spectrum)
-        magnitude[magnitude == 0] = 1e-15
-        psd_db = 20.0 * np.log10(magnitude) - 10.0 * np.log10(n)
-
-        # Exponential moving average
-        if self.avg_buffer is None or len(self.avg_buffer) != n:
-            self.avg_buffer = psd_db.copy()
-        else:
-            self.avg_buffer = self.avg_alpha * psd_db + (1 - self.avg_alpha) * self.avg_buffer
-
-        # Peak hold
-        if self.peak_hold is None or len(self.peak_hold) != n:
-            self.peak_hold = psd_db.copy()
-        else:
-            self.peak_hold = np.maximum(self.peak_hold, psd_db)
-
-        # Frequency axis
-        freqs = np.linspace(
-            (self.center_freq - self.sample_rate / 2) / 1e6,
-            (self.center_freq + self.sample_rate / 2) / 1e6,
-            n,
-        )
-
-        return freqs, psd_db, self.avg_buffer, self.peak_hold
-
-    def reset_peak_hold(self):
-        self.peak_hold = None
-
-
-class SimulatedAnalyzer(SpectrumAnalyzer):
-    """Drop-in replacement that generates synthetic UHF RFID-like signals
-    so the UI can be developed and demoed without real hardware."""
-
-    def open(self):
-        self.running = True
-        log.info("Simulated SDR opened  fc=%.3f MHz  fs=%.3f MHz",
-                 self.center_freq / 1e6, self.sample_rate / 1e6)
-
-    def close(self):
-        self.running = False
-        log.info("Simulated SDR closed")
-
-    def read_spectrum(self):
-        n = self.fft_size
-        t = time.time()
-
-        # Noise floor ~ -90 dBm
-        noise = np.random.normal(0, 0.005, n) + 1j * np.random.normal(0, 0.005, n)
-
-        # Inject a few UHF RFID-like carriers within the visible window
-        fs = self.sample_rate
-        fc = self.center_freq
-        lo = fc - fs / 2
-        hi = fc + fs / 2
-        tag_freqs = [902.75e6, 910.0e6, 915.25e6, 920.0e6, 926.0e6]
-
-        for f in tag_freqs:
-            if lo <= f <= hi:
-                # Time-varying amplitude to simulate bursty tag responses
-                amp = 0.08 + 0.06 * np.sin(2 * np.pi * 0.3 * t + f / 1e6)
-                offset = (f - fc) / fs  # normalised offset in [-0.5, 0.5]
-                phase = np.exp(2j * np.pi * offset * np.arange(n))
-                noise += amp * phase
-
-        # Broadband reader emission (wideband hump)
-        reader_center = 915e6
-        if lo <= reader_center <= hi:
-            bw = 500e3  # 500 kHz wide
-            center_bin = int((reader_center - lo) / fs * n)
-            spread = int(bw / fs * n / 2)
-            for i in range(max(0, center_bin - spread), min(n, center_bin + spread)):
-                bump = 0.12 * np.exp(-0.5 * ((i - center_bin) / (spread / 2.5)) ** 2)
-                bump *= (1 + 0.3 * np.sin(2 * np.pi * 1.7 * t))
-                noise[i] += bump
-
-        return self._compute_fft(noise)
-
-
-# ---------------------------------------------------------------------------
-# WebSocket server
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# WebSocket Server
+# ===========================================================================
 
 connected_clients = set()
+analyzer = None
+pie_decoder = None
+mock_decoder = None
+broadcast_task = None
+decode_task = None
+_cli_args = None  # stored from CLI for defaults
 
 
-async def handler(ws):
-    """Handle a single WebSocket client."""
-    connected_clients.add(ws)
-    log.info("Client connected (%d total)", len(connected_clients))
-    try:
-        async for msg in ws:
-            # Clients can send JSON commands
-            try:
-                cmd = json.loads(msg)
-                await process_command(cmd)
-            except json.JSONDecodeError:
-                pass
-    finally:
-        connected_clients.discard(ws)
-        log.info("Client disconnected (%d total)", len(connected_clients))
+async def broadcast_to_clients(payload):
+    """Send a JSON payload to all connected clients."""
+    if not connected_clients:
+        return
+    msg = json.dumps(payload) if isinstance(payload, dict) else payload
+    coros = [c.send(msg) for c in connected_clients.copy()]
+    await asyncio.gather(*coros, return_exceptions=True)
 
 
-analyzer: SpectrumAnalyzer = None  # set in main()
-
-
-async def process_command(cmd):
-    """Process a control command from the UI."""
-    action = cmd.get("action")
-    if action == "set_center_freq":
-        analyzer.set_center_freq(float(cmd["value"]) * 1e6)
-    elif action == "set_gain":
-        analyzer.set_gain(float(cmd["value"]))
-    elif action == "set_sample_rate":
-        analyzer.set_sample_rate(float(cmd["value"]) * 1e6)
-    elif action == "set_fft_size":
-        analyzer.set_fft_size(int(cmd["value"]))
-    elif action == "set_avg_alpha":
-        analyzer.avg_alpha = float(cmd["value"])
-    elif action == "reset_peak":
-        analyzer.reset_peak_hold()
-    elif action == "get_bands":
-        # Send band definitions to newly-connected clients
-        pass  # bands are sent with every frame
-
-
-async def broadcast_loop(interval=0.05):
+async def spectrum_loop(fps=20):
     """Read SDR data and push spectrum frames to all connected clients."""
-    while analyzer.running:
+    interval = 1.0 / fps
+    while analyzer and analyzer.running:
         if connected_clients:
             try:
-                freqs, live, avg, peak = analyzer.read_spectrum()
+                result = analyzer.read_spectrum()
+                (freqs, live, avg, peak), raw_iq = result
+
                 payload = json.dumps({
                     "type": "spectrum",
                     "freqs": freqs.tolist(),
@@ -284,55 +84,186 @@ async def broadcast_loop(interval=0.05):
                     "fft_size": analyzer.fft_size,
                     "bands": RFID_BANDS,
                 })
-                coros = [c.send(payload) for c in connected_clients.copy()]
-                await asyncio.gather(*coros, return_exceptions=True)
+                await broadcast_to_clients(payload)
+
+                # Real-time PIE decode from raw IQ (hardware mode only)
+                if pie_decoder and raw_iq is not None:
+                    decoded = pie_decoder.process(raw_iq)
+                    for msg in decoded:
+                        await broadcast_to_clients(msg)
+
             except Exception as e:
                 log.error("broadcast error: %s", e)
         await asyncio.sleep(interval)
 
 
-# ---------------------------------------------------------------------------
-# Lightweight HTTP server for the UI
-# ---------------------------------------------------------------------------
+async def mock_decode_loop():
+    """Generate and broadcast simulated RFID decode messages."""
+    while mock_decoder and mock_decoder.enabled:
+        try:
+            messages = mock_decoder.generate_round()
+            prev_delay = 0
+            for delay_ms, msg in messages:
+                wait = (delay_ms - prev_delay) / 1000.0
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                prev_delay = delay_ms
+                await broadcast_to_clients(msg)
+            # Inter-round gap
+            await asyncio.sleep(0.10 + random.random() * 0.15)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.error("mock decode error: %s", e)
+            await asyncio.sleep(0.5)
+
+
+async def select_device(index):
+    """Select an RTL-SDR device (or simulated). Returns response dict."""
+    global analyzer, pie_decoder, mock_decoder, broadcast_task, decode_task
+
+    # Cancel running tasks
+    for task in [broadcast_task, decode_task]:
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    broadcast_task = None
+    decode_task = None
+
+    # Close existing analyzer
+    if analyzer:
+        analyzer.close()
+        analyzer = None
+    pie_decoder = None
+    mock_decoder = None
+
+    args = _cli_args
+    fps = args.fps if args else 20
+
+    if index == -1:
+        # Simulated mode
+        analyzer = SimulatedAnalyzer(
+            center_freq=(args.freq if args else 915.0) * 1e6,
+            sample_rate=(args.rate if args else 2.4) * 1e6,
+            gain=args.gain if args else 40,
+            fft_size=args.fft if args else 1024,
+        )
+        analyzer.open()
+        mock_decoder = MockRFIDDecoder()
+        broadcast_task = asyncio.create_task(spectrum_loop(fps))
+        decode_task = asyncio.create_task(mock_decode_loop())
+        name = "Simulated RTL-SDR"
+        log.info("Selected device: %s", name)
+        return {"type": "device_selected", "name": name, "success": True}
+    else:
+        # Real hardware
+        try:
+            analyzer = SpectrumAnalyzer(
+                center_freq=(args.freq if args else 915.0) * 1e6,
+                sample_rate=(args.rate if args else 2.4) * 1e6,
+                gain=args.gain if args else 40,
+                fft_size=args.fft if args else 1024,
+                device_index=index,
+            )
+            analyzer.open()
+            pie_decoder = PIEDecoder(
+                sample_rate=int(analyzer.sample_rate),
+                center_freq_mhz=analyzer.center_freq / 1e6,
+            )
+            broadcast_task = asyncio.create_task(spectrum_loop(fps))
+            name = f"RTL-SDR #{index}"
+            log.info("Selected device: %s", name)
+            return {"type": "device_selected", "name": name, "success": True}
+        except Exception as e:
+            log.error("Failed to open device %d: %s", index, e)
+            return {"type": "device_selected", "name": "", "success": False, "error": str(e)}
+
+
+async def handler(ws):
+    """Handle a single WebSocket client."""
+    connected_clients.add(ws)
+    log.info("Client connected (%d total)", len(connected_clients))
+
+    # Send device list on connect
+    try:
+        devices = enumerate_devices()
+        await ws.send(json.dumps({"type": "devices", "devices": devices}))
+    except Exception as e:
+        log.error("Error sending device list: %s", e)
+
+    try:
+        async for msg in ws:
+            try:
+                cmd = json.loads(msg)
+                await process_command(cmd, ws)
+            except json.JSONDecodeError:
+                pass
+    finally:
+        connected_clients.discard(ws)
+        log.info("Client disconnected (%d total)", len(connected_clients))
+
+
+async def process_command(cmd, ws):
+    """Process a control command from the UI."""
+    action = cmd.get("action")
+
+    if action == "list_devices":
+        devices = enumerate_devices()
+        await ws.send(json.dumps({"type": "devices", "devices": devices}))
+
+    elif action == "select_device":
+        result = await select_device(cmd.get("index", -1))
+        await ws.send(json.dumps(result))
+
+    elif action == "set_sequence_mode":
+        if mock_decoder:
+            mock_decoder.mode = cmd.get("value", "mixed")
+
+    elif analyzer:
+        if action == "set_center_freq":
+            analyzer.set_center_freq(float(cmd["value"]) * 1e6)
+            if pie_decoder:
+                pie_decoder.set_center_freq(float(cmd["value"]))
+        elif action == "set_gain":
+            analyzer.set_gain(float(cmd["value"]))
+        elif action == "set_sample_rate":
+            analyzer.set_sample_rate(float(cmd["value"]) * 1e6)
+            if pie_decoder:
+                pie_decoder.reset()
+        elif action == "set_fft_size":
+            analyzer.set_fft_size(int(cmd["value"]))
+        elif action == "set_avg_alpha":
+            analyzer.avg_alpha = float(cmd["value"])
+        elif action == "reset_peak":
+            analyzer.reset_peak_hold()
+
+
+# ===========================================================================
+# HTTP Server
+# ===========================================================================
 
 def start_http_server(port, directory):
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=directory, **kw)
         def log_message(self, fmt, *args):
-            pass  # silence request logs
+            pass
 
     httpd = HTTPServer(("0.0.0.0", port), Handler)
     log.info("HTTP server on http://0.0.0.0:%d", port)
     httpd.serve_forever()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Entry Point
+# ===========================================================================
 
 async def main(args):
-    global analyzer
-
-    if args.simulate or not HAS_RTLSDR:
-        if not args.simulate and not HAS_RTLSDR:
-            log.warning("pyrtlsdr not found — falling back to simulation mode")
-        analyzer = SimulatedAnalyzer(
-            center_freq=args.freq * 1e6,
-            sample_rate=args.rate * 1e6,
-            gain=args.gain,
-            fft_size=args.fft,
-        )
-    else:
-        analyzer = SpectrumAnalyzer(
-            center_freq=args.freq * 1e6,
-            sample_rate=args.rate * 1e6,
-            gain=args.gain,
-            fft_size=args.fft,
-            device_index=args.device,
-        )
-
-    analyzer.open()
+    global _cli_args
+    _cli_args = args
 
     # Start HTTP file server in a daemon thread
     ui_dir = str(Path(__file__).parent)
@@ -341,10 +272,11 @@ async def main(args):
                                    daemon=True)
     http_thread.start()
 
-    # Start WebSocket server
+    # Start WebSocket server (no analyzer yet — client selects device)
     log.info("WebSocket server on ws://0.0.0.0:%d", args.ws_port)
+    log.info("Open http://localhost:%d to start", args.http_port)
     async with websockets.serve(handler, "0.0.0.0", args.ws_port):
-        await broadcast_loop(interval=1.0 / args.fps)
+        await asyncio.Future()  # run forever
 
 
 def cli():
@@ -365,8 +297,6 @@ def cli():
                    help=f"HTTP port (default: {DEFAULT_HTTP_PORT})")
     p.add_argument("--fps",          type=int,   default=20,
                    help="Target frames per second (default: 20)")
-    p.add_argument("--simulate",     action="store_true",
-                   help="Use simulated SDR data (no hardware required)")
     return p.parse_args()
 
 
