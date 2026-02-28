@@ -30,12 +30,6 @@ Real-time spectrum analyzer and protocol decoder for UHF RFID bands (860–960 M
 
 Real-time spectrum FFT (top right), waterfall spectrogram (bottom right), and EPC Gen2 protocol decode table (left) showing inventory rounds, access commands, Gen2v2 security operations, and Gen2X extensions.
 
-### Waterfall + Protocol Decode
-
-![Waterfall view with decode panel](screenshots/waterfall-decode.png)
-
-Full waterfall/spectrogram view alongside the protocol decode panel displaying Reader→Tag and Tag→Reader message sequences including EPC reads, memory access, and authentication.
-
 ## Requirements
 
 **Backend (Python)**
