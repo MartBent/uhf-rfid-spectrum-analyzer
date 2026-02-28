@@ -1,41 +1,44 @@
 # UHF RFID Spectrum Analyzer
 
-Real-time spectrum analyzer for UHF RFID bands (860–960 MHz) using an RTL-SDR dongle. Supports two connection modes:
+Real-time spectrum analyzer and protocol decoder for UHF RFID bands (860–960 MHz) using an RTL-SDR dongle.
 
-- **WebSocket mode** — Python backend controls the RTL-SDR; data streamed to browser via WebSocket
-- **WebUSB mode** — Browser talks directly to the RTL-SDR over USB (no backend needed, Chrome/Edge only)
+- **React + TypeScript** frontend (Vite) with real-time spectrum, waterfall, RSSI timeline, and protocol decode views
+- **Python backend** streams FFT spectrum + decoded RFID commands over WebSocket
+- **Reusable RFID decoder library** (`rfid_decoder.py`) — standalone Gen2 decode + signal processing, usable without the web UI
+- **Simulation mode** — full demo with no hardware needed
 
 ## Features
 
 - Real-time spectrum display with configurable FFT size (256–4096)
 - Waterfall / spectrogram view
 - RSSI timeline with decode message markers
-- **Real-time EPC Gen2 reader command decode** via PIE demodulation (WebUSB mode)
+- **Real-time EPC Gen2 reader command decode** via PIE demodulation from IQ samples
 - EPC Gen2 / Gen2v2 / Gen2X protocol decode panel with round tracking
 - UHF RFID band overlays for FCC, ETSI, China, Japan, Korea, Brazil, Australia
 - Live, average (EMA), and peak-hold traces
 - Frequency markers with peak search
 - Quick-tune presets for regional RFID bands
 - Adjustable center frequency, span, gain, reference level, and dynamic range
-- Simulation mode with full protocol decode demo (no hardware needed)
+- Light / dark theme toggle
+- Device discovery and selection (real RTL-SDR or simulated)
 
 ## Screenshots
 
-### Spectrum + RSSI Timeline with Protocol Decode
+### Spectrum + Protocol Decode
 
-![Spectrum and RSSI timeline view with Gen2 protocol decode](screenshots/spectrum-timeline.png)
+![Spectrum and protocol decode view](screenshots/spectrum-decode.png)
 
-Real-time spectrum display (top), RSSI timeline with decoded command markers (middle), and EPC Gen2 protocol decode table (bottom). Shows inventory rounds, access commands, Gen2v2 security operations, and Gen2X extensions.
+Real-time spectrum FFT (top right), waterfall spectrogram (bottom right), and EPC Gen2 protocol decode table (left) showing inventory rounds, access commands, Gen2v2 security operations, and Gen2X extensions.
 
-### Waterfall View with Protocol Decode
+### Waterfall + Protocol Decode
 
-![Waterfall spectrogram view with decode panel](screenshots/waterfall-decode.png)
+![Waterfall view with decode panel](screenshots/waterfall-decode.png)
 
-Waterfall/spectrogram view showing signal energy over time, with the protocol decode panel displaying Reader→Tag and Tag→Reader message sequences including EPC reads, memory access, and authentication.
+Full waterfall/spectrogram view alongside the protocol decode panel displaying Reader→Tag and Tag→Reader message sequences including EPC reads, memory access, and authentication.
 
 ## Requirements
 
-### WebSocket mode (Python backend)
+**Backend (Python)**
 
 ```
 Python 3.8+
@@ -45,34 +48,40 @@ pip install -r requirements.txt
 Hardware: RTL-SDR dongle (RTL2832U-based)
 
 System: `librtlsdr` must be installed:
-- Debian/Ubuntu: `sudo apt install librtlsdr-dev`
 - macOS: `brew install librtlsdr`
+- Debian/Ubuntu: `sudo apt install librtlsdr-dev`
 - Windows: Zadig driver + librtlsdr DLLs
 
-### WebUSB mode (browser-only)
+**Frontend (Node.js)**
 
-- Chrome, Edge, or Opera (WebUSB support required)
-- HTTPS or localhost
-- Linux: udev rule for RTL-SDR USB access (or run browser as root for testing)
-
-## Usage
-
-### Option 1: WebSocket mode (Python backend)
-
-```bash
-# Start with real hardware
-python server.py
-
-# Start in simulation mode (no RTL-SDR needed)
-python server.py --simulate
-
-# Custom settings
-python server.py -f 915 -r 2.4 -g 40 -n 1024 --fps 20
+```
+Node.js 18+
+npm install
 ```
 
-Then open `http://localhost:8080` in your browser.
+## Quick Start
 
-#### CLI options
+```bash
+# Start both backend + frontend dev server
+./start.sh
+
+# Stop both
+./stop.sh
+```
+
+Then open `http://localhost:8080`, select a device (or **Simulated RTL-SDR** for demo mode), and the spectrum + decode stream starts.
+
+### Manual Start
+
+```bash
+# Backend (WebSocket server on :8765, HTTP on :8080)
+DYLD_LIBRARY_PATH=/opt/homebrew/lib python server.py
+
+# Frontend (Vite dev server on :8080)
+npm run dev
+```
+
+### CLI Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -84,40 +93,51 @@ Then open `http://localhost:8080` in your browser.
 | `--ws-port` | WebSocket port | 8765 |
 | `--http-port` | HTTP port | 8080 |
 | `--fps` | Target frame rate | 20 |
-| `--simulate` | Simulated SDR data | off |
-
-### Option 2: WebUSB mode (no backend)
-
-Serve the files over HTTPS or localhost:
-
-```bash
-# Simple local server
-python -m http.server 8080
-```
-
-Open `http://localhost:8080` in Chrome/Edge, click **WebUSB** in the sidebar, then **Connect RTL-SDR via USB**.
-
-The browser will prompt you to select the RTL-SDR device. All signal processing (FFT, averaging, peak hold) and protocol decode runs client-side in JavaScript.
-
-### Option 3: Demo mode (no hardware)
-
-```bash
-python -m http.server 8080
-```
-
-Open `http://localhost:8080?demo` — starts the simulated RTL-SDR with full protocol decode demo automatically.
 
 ## File Structure
 
 ```
 rfid-spectrum-analyzer/
-├── index.html           # Main UI (spectrum + waterfall + controls + decode panel)
-├── webusb-rtlsdr.js     # WebUSB RTL-SDR driver + browser-side FFT
-├── pie-decoder.js       # PIE demodulator + EPC Gen2 command parser (real-time decode)
-├── server.py            # Python WebSocket backend
+├── rfid_decoder.py      # Standalone RFID decode library (reusable)
+├── server.py            # WebSocket + HTTP server (imports rfid_decoder)
+├── start.sh             # Start backend + frontend
+├── stop.sh              # Stop both
 ├── requirements.txt     # Python dependencies
-├── screenshots/         # UI screenshots
+├── package.json         # Node.js dependencies
+├── vite.config.ts       # Vite configuration
+├── src/
+│   ├── App.tsx          # Main application layout
+│   ├── main.tsx         # Entry point
+│   ├── theme.ts         # Ant Design theme config
+│   ├── components/      # React components
+│   │   ├── Header.tsx           # Top bar (device, tabs, controls)
+│   │   ├── Sidebar.tsx          # Settings panel
+│   │   ├── DecodePanel.tsx      # Protocol decode container
+│   │   ├── DecodeTable.tsx      # Gen2 command table
+│   │   ├── SpectrumCanvas.tsx   # Spectrum FFT + waterfall canvas
+│   │   ├── TimelineCanvas.tsx   # RSSI timeline canvas
+│   │   └── ...                  # Connection, display, frequency panels
+│   ├── canvas/          # Canvas rendering (spectrum, waterfall, timeline)
+│   ├── services/        # WebSocket connection, PIE decoder, mock data
+│   └── stores/          # Zustand state (appStore, decodeStore)
+├── screenshots/
 └── README.md
+```
+
+### `rfid_decoder.py` — Standalone Library
+
+The RFID decode logic is a standalone Python library that can be imported independently:
+
+```python
+from rfid_decoder import (
+    PIEDecoder,          # Decode Gen2 commands from raw IQ samples
+    MockRFIDDecoder,     # Generate simulated Gen2 command sequences
+    SpectrumAnalyzer,    # RTL-SDR device wrapper + FFT
+    SimulatedAnalyzer,   # Synthetic spectrum generation
+    enumerate_devices,   # RTL-SDR device discovery
+    parse_gen2_command,  # Parse raw bits into Gen2 commands
+    crc5, crc16,         # EPC Gen2 CRC functions
+)
 ```
 
 ## Protocol Reference
